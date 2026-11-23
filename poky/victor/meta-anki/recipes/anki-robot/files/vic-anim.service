@@ -9,6 +9,7 @@ After=vic-robot.service anki-audio-init.service
 
 [Service]
 EnvironmentFile=/anki/etc/vic-anim.env
+Environment="LD_PRELOAD=/anki/lib/libvicos_time32_shim.so"
 Restart=no
 ExecStartPre=-/bin/systemctl stop vic-bootAnim.service
 ExecStart=/anki/bin/vic-anim $VIC_ANIM_OPTS

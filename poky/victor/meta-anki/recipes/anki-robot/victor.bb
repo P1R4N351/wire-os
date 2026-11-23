@@ -327,7 +327,9 @@ DEPENDS += "zlib"
 #
 
 
-INSANE_SKIP:${PN} = " already-stripped ldflags dev-elf"
+# Quarantine 32bit-time QA waiver strictly to closed-source/3rd prebuilts
+# (libnscube.so, libbabile.so, libAk*.a, libpv_porcupine.a, libAVSCommon.so).
+INSANE_SKIP:${PN} = " already-stripped ldflags dev-elf 32bit-time"
 EXCLUDE_FROM_SHLIBS = "1"
 
 FILES:${PN} += "anki/"

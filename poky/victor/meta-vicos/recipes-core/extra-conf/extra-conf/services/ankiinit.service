@@ -3,6 +3,7 @@ SourcePath=/etc/initscripts/ankiinit
 Description=Anki Post Boot Service
 Requires=partition-links.service leproperties.service mount-data.service
 After=partition-links.service leproperties.service mount-data.service
+Before=anki-robot.target start-anki.service vic-engine.service
 
 [Service]
 Type=oneshot

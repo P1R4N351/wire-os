@@ -1,116 +1,99 @@
 #!/bin/sh
-### This file should only contain hardware initalization commands that will only fail if the hardware is
-##  bad. Anything that we can limp along without should be put somewhere else so that this script exits
-##  with status 0 and the system init process can continue.
+### This file should only contain hardware initialization commands that will only fail if the hardware is
+##  bad. Anything that we can limp along without should be placed so init exits 0 and boot continues.
+set -eu
+
+wait_for_camera_media() {
+	sensor_name="$1"
+	attempt=0
+	while [ "$attempt" -lt 25 ]; do
+		topology="$(media-ctl -p 2>/dev/null || true)"
+		case "$topology" in
+			*"$sensor_name"*msm_vfe0_rdi0*|*msm_vfe0_rdi0*"$sensor_name"*)
+				return 0
+				;;
+		esac
+		attempt=$((attempt + 1))
+		sleep 0.2 2>/dev/null || sleep 1
+	done
+	return 1
+}
+
+configure_camera_pipeline() {
+	hw_ver="$(/bin/emr-cat v 2>/dev/null || true)"
+	if [ "$hw_ver" = "00000020" ]; then
+		modprobe bf2253l || return 1
+		SENSOR="bf2253l 0-006e"
+		RES="1600x1200"
+	else
+		modprobe gc1066 || return 1
+		SENSOR="gc1066 0-003c"
+		RES="1280x720"
+	fi
+	wait_for_camera_media "$SENSOR" || return 1
+	for link in 		'"msm_csiphy0":1 -> "msm_csid0":0 [1]' 		'"msm_csid0":1 -> "msm_ispif0":0 [1]' 		'"msm_ispif0":1 -> "msm_vfe0_rdi0":0 [1]'; do
+		media-ctl --links "$link" || return 1
+	done
+	for entry in 		"$SENSOR:0" msm_csiphy0:0 msm_csiphy0:1 		msm_csid0:0 msm_csid0:1 msm_ispif0:0 		msm_ispif0:1 msm_vfe0_rdi0:0 msm_vfe0_rdi0:1; do
+		ent="${entry%:*}"
+		pad="${entry##*:}"
+		media-ctl --set-v4l2 "\"$ent\":$pad[fmt:SBGGR10_1X10/$RES]" || return 1
+	done
+}
+
+setup_usb_gadget() (
+	mount -t configfs none /sys/kernel/config 2>/dev/null || true
+	cd /sys/kernel/config/usb_gadget || return 1
+	mkdir -p g1 && cd g1 || return 1
+	echo 0x18d1 > idVendor && echo 0x4ee8 > idProduct
+	mkdir -p strings/0x409
+	echo "Anki" > strings/0x409/manufacturer
+	echo "Vector" > strings/0x409/product
+	echo "0002" > strings/0x409/serialnumber
+	mkdir -p configs/c.1/strings/0x409
+	echo "ecm" > configs/c.1/strings/0x409/configuration
+	mkdir -p functions/ecm.usb0
+	echo 02:00:00:00:00:01 > functions/ecm.usb0/dev_addr
+	echo 02:00:00:00:00:02 > functions/ecm.usb0/host_addr
+	if [ ! -e configs/c.1/ecm.usb0 ]; then
+		ln -s functions/ecm.usb0 configs/c.1/
+	fi
+	echo ci_hdrc.0 > UDC
+)
 
 mkdir -p /dev/socket
 chown anki:anki /dev/socket
+# Limit CPU frequency to prevent thermal throttling while idle scaling runs
+echo 533333 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq || true
+# Move RT FIFO tasks off core 0 to reduce timer interrupt induced jitter
+pgrep tty | xargs -I PID taskset -p 0xe PID || true
 
-# @nathan-anki  - to stop overheating, limit CPU to 533MHz, RAM to 400MHz
-# this is now handled by wired, theoretically
-echo 533333 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
-#End clock speed limits
-
-# Move RT FIFO tasks off core 0 to reduce timer interrupt induced jitter.
-pgrep tty | xargs -I PID taskset -p 0xe PID
-
-# # TODO Move this power rail controll into the camera driver
-# CAM_REG_GPIO=83
-# if [ ! -d /sys/class/gpio/gpio$CAM_REG_GPIO ]; then
-#     echo $CAM_REG_GPIO > /sys/class/gpio/export
-# fi
-# echo out > /sys/class/gpio/gpio$CAM_REG_GPIO/direction
-# echo 1 > /sys/class/gpio/gpio$CAM_REG_GPIO/value
-# End camera force hack
-
-# emr-cat prints a placeholder value even on error
-SERIALNO=`/bin/emr-cat e`
-HAVE_EMR=$?
-
-# And put the serial number in properties
-for i in `seq 1 5`;
-do
-    setprop ro.serialno $SERIALNO
-    if test ! -z `getprop ro.serialno`; then break; fi
-    sleep 1;
+SERIALNO="$(/bin/emr-cat e 2>/dev/null || true)"
+for _ in 1 2 3 4 5; do
+	setprop ro.serialno "$SERIALNO" || true
+	if [ -n "$(getprop ro.serialno 2>/dev/null || true)" ]; then
+		break
+	fi
+	sleep 1
 done
 
-# Put the model into a property
-setprop ro.hw.ver `/bin/emr-cat v`
-setprop ro.model `/bin/emr-cat m`
-
+setprop ro.hw.ver "$(/bin/emr-cat v 2>/dev/null || true)" || true
+setprop ro.model "$(/bin/emr-cat m 2>/dev/null || true)" || true
 if [ -x /usr/bin/vic-christen ]; then
-    /usr/bin/vic-christen
+	/usr/bin/vic-christen || true
 fi
 
-/bin/hostname `getprop anki.robot.name | tr ' ' '-'`
-
-# If we are coming up from a maintenance reboot, let the anki apps know
+ROBOT_NAME="$(getprop anki.robot.name 2>/dev/null || echo Vector)"
+/bin/hostname "$(printf '%s' "$ROBOT_NAME" | tr ' ' '-')" || true
 if [ -e /data/maintenance_reboot ]; then
-    mv /data/maintenance_reboot /run/after_maintenance_reboot
+	mv /data/maintenance_reboot /run/after_maintenance_reboot
 fi
+echo "VicOS Version: $(getprop ro.anki.version 2>/dev/null || true)" > /dev/kmsg || true
 
-#Enable Ramoops
-#modprobe ramoops
-
-# Report OS Version to boot log
-echo "VicOS Version: `getprop ro.anki.version`" > /dev/kmsg
-
-# camera
-
-SENSOR=""
-RES=""
-if [ $(emr-cat v) == "00000020" ]; then
-	modprobe bf2253l
-	SENSOR="bf2253l 0-006e"
-	RES="1600x1200"
-else
- 	modprobe gc1066
-	SENSOR="gc1066 0-003c"
-	RES="1280x720"
-fi
-sleep 1
-
-media-ctl --links "\"$SENSOR\":0 -> \"msm_csiphy0\":0 [1]"
-media-ctl --links '"msm_csiphy0":1 -> "msm_csid0":0 [1]'
-media-ctl --links '"msm_csid0":1 -> "msm_ispif0":0 [1]'
-media-ctl --links '"msm_ispif0":1 -> "msm_vfe0_rdi0":0 [1]'
-
-media-ctl --set-v4l2 "\"$SENSOR\":0[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_csiphy0\":0[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_csiphy0\":1[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_csid0\":0[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_csid0\":1[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_ispif0\":0[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_ispif0\":1[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_vfe0_rdi0\":0[fmt:SBGGR10_1X10/$RES]"
-media-ctl --set-v4l2 "\"msm_vfe0_rdi0\":1[fmt:SBGGR10_1X10/$RES]"
-
-# usb
-
-mount -t configfs none /sys/kernel/config 2>/dev/null || true
-cd /sys/kernel/config/usb_gadget
-mkdir -p g1
-cd g1
-echo 0x18d1 > idVendor
-echo 0x4ee8 > idProduct
-mkdir -p strings/0x409
-echo "Anki"   > strings/0x409/manufacturer
-echo "Vector" > strings/0x409/product
-echo "0002"   > strings/0x409/serialnumber
-mkdir -p configs/c.1/strings/0x409
-echo "ecm" > configs/c.1/strings/0x409/configuration
-mkdir -p functions/ecm.usb0
-echo 02:00:00:00:00:01 > functions/ecm.usb0/dev_addr
-echo 02:00:00:00:00:02 > functions/ecm.usb0/host_addr
-ln -s functions/ecm.usb0 configs/c.1/
-echo ci_hdrc.0 > UDC
-
-# wlan
-
-echo start > /sys/class/remoteproc/remoteproc1/state
-
-ip addr add 192.168.7.2/24 dev usb0
-ip link set usb0 up
+configure_camera_pipeline || echo "ankiinit: camera media setup failed" > /dev/kmsg
+setup_usb_gadget || echo "ankiinit: usb gadget setup failed" > /dev/kmsg
+echo start > /sys/class/remoteproc/remoteproc1/state || true
+ip addr add 192.168.7.2/24 dev usb0 || true
+ip link set usb0 up || true
 
 exit 0

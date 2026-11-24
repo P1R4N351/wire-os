@@ -1,103 +1,203 @@
 From: P1R4N351 <P1R4N351@users.noreply.github.com>
-Subject: [PATCH] runtime: use clock_gettime64 (#403) on linux/arm for Y2K38 safety
-Upstream-Status: Backport [equivalent 64-bit time syscall behavior]
+Subject: [PATCH] runtime: use 64-bit time for clock_gettime and usleep on linux/arm
+Upstream-Status: Backport [equivalent to golang/go#83314 / CLs 701615, 712642]
 
-On 32-bit linux/arm, Go 1.25.9 runtime.walltime and runtime.nanotime1 invoke
-32-bit SYS_clock_gettime (263) / __vdso_clock_gettime with a 12-byte stack
-frame and hardcode sec_hi = 0. Across 2038-01-19T03:14:07Z this overflows.
+On 32-bit linux/arm, upstream Go 1.25.9 calls 32-bit __vdso_clock_gettime /
+SYS_clock_gettime (263) with sec_hi hardcoded to 0, and runtime.usleep invokes
+32-bit SYS_nanosleep (162), which returns -ENOSYS when CONFIG_COMPAT_32BIT_TIME
+is disabled.
 
-Invoke SYS_clock_gettime64 (SYS_BASE + 403) with a 16-byte struct
-__kernel_timespec and compute full 64-bit seconds and nanoseconds.
+Register __vdso_clock_gettime64 (0x5ec75a4 / 0xdb8d042), align the 64-bit
+__kernel_timespec to 8 bytes for vDSO C callers in walltime and nanotime1
+(falling back to SYS_clock_gettime64 #403, or 32-bit paths only on -ENOSYS),
+and switch runtime.usleep to SYS_clock_nanosleep_time64 (#407) with -ENOSYS
+fallback to SYS_nanosleep (162).
 
 Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 ---
 --- a/src/runtime/sys_linux_arm.s
 +++ b/src/runtime/sys_linux_arm.s
-@@ -41,6 +41,7 @@
+@@ -41,6 +41,8 @@
  #define SYS_nanosleep (SYS_BASE + 162)
  #define SYS_sched_getaffinity (SYS_BASE + 242)
  #define SYS_clock_gettime (SYS_BASE + 263)
 +#define SYS_clock_gettime64 (SYS_BASE + 403)
++#define SYS_clock_nanosleep_time64 (SYS_BASE + 407)
  #define SYS_timer_create (SYS_BASE + 257)
  #define SYS_timer_settime (SYS_BASE + 258)
  #define SYS_timer_delete (SYS_BASE + 261)
-@@ -346,55 +347,48 @@
+@@ -346,10 +348,43 @@
  	MOVW	R7, m_vdsoPC(R6)
  	RET
  
 -TEXT runtime·walltime(SB),NOSPLIT,$12-12
-+TEXT runtime·walltime(SB),NOSPLIT,$16-12
++TEXT runtime·walltime(SB),NOSPLIT,$24-12
++	// Linux 5.1+: 8-byte aligned struct __kernel_timespec (64-bit tv_sec).
  	MOVW	$CLOCK_REALTIME, R0
 -	MOVW	$spec-12(SP), R1	// timespec
-+	MOVW	$spec-16(SP), R1	// __kernel_timespec
- 
--	MOVW	runtime·vdsoClockgettimeSym(SB), R4
--	CMP	$0, R4
--	B.EQ	fallback
--
--	BL	runtime·vdsoCall(SB)
--
--	JMP	finish
--
--fallback:
--	MOVW	$SYS_clock_gettime, R7
-+	MOVW	$0, R2
-+	MOVW	R2, 0(R1)
-+	MOVW	R2, 4(R1)
-+	MOVW	R2, 8(R1)
-+	MOVW	R2, 12(R1)
++	MOVW	$spec-24(SP), R1
++	ADD	$7, R1
++	BIC	$7, R1
++
++	MOVW	runtime·vdsoClockgettime64Sym(SB), R4
++	CMP	$0, R4
++	B.EQ	fallback64
++
++	BL	runtime·vdsoCall(SB)
++	JMP	finish64
++
++fallback64:
 +	MOVW	$SYS_clock_gettime64, R7
++	SWI	$0
++	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels
++	B.EQ	time32
++
++finish64:
++	MOVW	$spec-24(SP), R3
++	ADD	$7, R3
++	BIC	$7, R3
++	MOVW	0(R3), R0	// tv_sec, low word
++	MOVW	4(R3), R1	// tv_sec, high word
++	MOVW	8(R3), R2	// tv_nsec, low word
++
++	MOVW	R0, sec_lo+0(FP)
++	MOVW	R1, sec_hi+4(FP)
++	MOVW	R2, nsec+8(FP)
++	RET
+ 
++time32:
++	MOVW	$CLOCK_REALTIME, R0
++	MOVW	$spec-24(SP), R1
++
+ 	MOVW	runtime·vdsoClockgettimeSym(SB), R4
+ 	CMP	$0, R4
+ 	B.EQ	fallback
+@@ -363,8 +398,8 @@
  	SWI	$0
  
--finish:
+ finish:
 -	MOVW	sec-12(SP), R0  // sec
 -	MOVW	nsec-8(SP), R2  // nsec
-+	MOVW	sec_lo-16(SP), R0	// sec_lo
-+	MOVW	sec_hi-12(SP), R1	// sec_hi
-+	MOVW	nsec-8(SP), R2		// nsec
++	MOVW	sec-24(SP), R0  // sec
++	MOVW	nsec-20(SP), R2  // nsec
  
  	MOVW	R0, sec_lo+0(FP)
--	MOVW	$0, R1
- 	MOVW	R1, sec_hi+4(FP)
- 	MOVW	R2, nsec+8(FP)
+ 	MOVW	$0, R1
+@@ -373,10 +408,49 @@
  	RET
  
  // func nanotime1() int64
 -TEXT runtime·nanotime1(SB),NOSPLIT,$12-8
-+TEXT runtime·nanotime1(SB),NOSPLIT,$16-8
++TEXT runtime·nanotime1(SB),NOSPLIT,$24-8
++	// Linux 5.1+: 8-byte aligned struct __kernel_timespec (64-bit tv_sec).
  	MOVW	$CLOCK_MONOTONIC, R0
 -	MOVW	$spec-12(SP), R1	// timespec
-+	MOVW	$spec-16(SP), R1	// __kernel_timespec
++	MOVW	$spec-24(SP), R1
++	ADD	$7, R1
++	BIC	$7, R1
  
--	MOVW	runtime·vdsoClockgettimeSym(SB), R4
--	CMP	$0, R4
--	B.EQ	fallback
--
--	BL	runtime·vdsoCall(SB)
--
--	JMP	finish
--
--fallback:
--	MOVW	$SYS_clock_gettime, R7
-+	MOVW	$0, R2
-+	MOVW	R2, 0(R1)
-+	MOVW	R2, 4(R1)
-+	MOVW	R2, 8(R1)
-+	MOVW	R2, 12(R1)
++	MOVW	runtime·vdsoClockgettime64Sym(SB), R4
++	CMP	$0, R4
++	B.EQ	fallback64
++
++	BL	runtime·vdsoCall(SB)
++	JMP	finish64
++
++fallback64:
 +	MOVW	$SYS_clock_gettime64, R7
++	SWI	$0
++	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels
++	B.EQ	time32
++
++finish64:
++	MOVW	$spec-24(SP), R3
++	ADD	$7, R3
++	BIC	$7, R3
++	MOVW	0(R3), R0	// tv_sec, low word
++	MOVW	4(R3), R4	// tv_sec, high word
++	MOVW	8(R3), R2	// tv_nsec, low word
++
++	MOVW	$1000000000, R3
++	MULLU	R0, R3, (R1, R0)
++	MUL	R3, R4
++	ADD	R4, R1
++	ADD.S	R2, R0
++	ADC	$0, R1	// Add carry bit to upper half.
++
++	MOVW	R0, ret_lo+0(FP)
++	MOVW	R1, ret_hi+4(FP)
++	RET
++
++time32:
++	MOVW	$CLOCK_MONOTONIC, R0
++	MOVW	$spec-24(SP), R1
++
+ 	MOVW	runtime·vdsoClockgettimeSym(SB), R4
+ 	CMP	$0, R4
+ 	B.EQ	fallback
+@@ -390,8 +464,8 @@
  	SWI	$0
  
--finish:
+ finish:
 -	MOVW	sec-12(SP), R0  // sec
 -	MOVW	nsec-8(SP), R2  // nsec
-+	MOVW	sec_lo-16(SP), R0	// sec_lo
-+	MOVW	sec_hi-12(SP), R5	// sec_hi
-+	MOVW	nsec-8(SP), R2		// nsec
++	MOVW	sec-24(SP), R0  // sec
++	MOVW	nsec-20(SP), R2  // nsec
  
  	MOVW	$1000000000, R3
  	MULLU	R0, R3, (R1, R0)
-+	MUL	R3, R5, R4
-+	ADD	R4, R1
- 	ADD.S	R2, R0
- 	ADC	$0, R1	// Add carry bit to upper half.
+@@ -563,17 +637,36 @@
+ 	MOVW	R0, ret+16(FP)
+ 	RET
  
+-TEXT runtime·usleep(SB),NOSPLIT,$12
++TEXT runtime·usleep(SB),NOSPLIT,$20
+ 	MOVW	usec+0(FP), R0
+ 	CALL	runtime·usplitR0(SB)
+-	MOVW	R0, 4(R13)
+-	MOVW	$1000, R0	// usec to nsec
+-	MUL	R0, R1
++	MOVW	$1000, R2	// usec to nsec
++	MUL	R2, R1
++
++	// Linux 5.1+: clock_nanosleep_time64(CLOCK_MONOTONIC, 0, &kts, NULL).
++	MOVW	R0, 4(R13)	// tv_sec, low word
++	MOVW	$0, R2
++	MOVW	R2, 8(R13)	// tv_sec, high word
++	MOVW	R1, 12(R13)	// tv_nsec, low word
++	MOVW	R2, 16(R13)	// tv_nsec, high word
++	MOVW	$CLOCK_MONOTONIC, R0
++	MOVW	$0, R1		// flags: relative
++	MOVW	$4(R13), R2
++	MOVW	$0, R3
++	MOVW	$SYS_clock_nanosleep_time64, R7
++	SWI	$0
++	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels?
++	B.NE	done
++
++	// Fallback to 32-bit nanosleep on kernels before Linux 5.1.
++	MOVW	12(R13), R1
+ 	MOVW	R1, 8(R13)
+ 	MOVW	$4(R13), R0
+ 	MOVW	$0, R1
+ 	MOVW	$SYS_nanosleep, R7
+ 	SWI	$0
++
++done:
+ 	RET
+ 
+ // As for cas, memory barriers are complicated on ARM, but the kernel
+--- a/src/runtime/vdso_linux_arm.go
++++ b/src/runtime/vdso_linux_arm.go
+@@ -15,7 +15,11 @@
+ 
+ var vdsoSymbolKeys = []vdsoSymbolKey{
+ 	{"__vdso_clock_gettime", 0xd35ec75, 0x6e43a318, &vdsoClockgettimeSym},
++	{"__vdso_clock_gettime64", 0x5ec75a4, 0xdb8d042, &vdsoClockgettime64Sym},
+ }
+ 
+ // initialize to fall back to syscall
+ var vdsoClockgettimeSym uintptr = 0
++
++// __vdso_clock_gettime64 (Linux 5.1 and later).
++var vdsoClockgettime64Sym uintptr = 0

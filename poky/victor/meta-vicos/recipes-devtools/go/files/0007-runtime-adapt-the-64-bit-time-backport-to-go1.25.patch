@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:34:24 +0000
+Subject: [PATCH] runtime: adapt the 64-bit time backport to go1.25
+
+The backported parseRelease calls strconv.Atoi from internal/strconv,
+which returns an error; go1.25's os_linux.go imports
+internal/runtime/strconv, whose Atoi returns (int, bool).
+getKernelVersion refers to package linux, which go1.26 renamed from
+internal/runtime/syscall; go1.25 imports it as syscall.
+
+Upstream-Status: Inappropriate [go1.25 backport adaptation; upstream go1.26 uses internal/strconv]
+Signed-off-by: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+---
+ src/runtime/os_linux.go | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/runtime/os_linux.go b/src/runtime/os_linux.go
+index f0845363a9..a9b85d92e8 100644
+--- a/src/runtime/os_linux.go
++++ b/src/runtime/os_linux.go
+@@ -949,8 +949,8 @@ type kernelVersion struct {
+ // failing, because this is called during osinit before the runtime
+ // is fully initialized and a throw here is unrecoverable.
+ func getKernelVersion() (kv kernelVersion, ok bool) {
+-	var buf linux.Utsname
+-	if e := linux.Uname(&buf); e != 0 {
++	var buf syscall.Utsname
++	if e := syscall.Uname(&buf); e != 0 {
+ 		return kernelVersion{}, false
+ 	}
+ 	rel := gostringnocopy(&buf.Release[0])
+@@ -980,8 +980,8 @@ func parseRelease(rel string) (major, minor, patch int, ok bool) {
+ 		if i == 0 {
+ 			return 0, false, false
+ 		}
+-		n, err := strconv.Atoi(rel[:i])
+-		if err != nil {
++		n, ok = strconv.Atoi(rel[:i])
++		if !ok {
+ 			return 0, false, false
+ 		}
+ 		if i < len(rel) && rel[i] == '.' {

@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Maslowski <info@orangecms.org>
+Date: Thu, 18 Sep 2025 15:43:42 +0000
+Subject: [PATCH] runtime: use futexes with 64-bit time on Linux
+
+Linux introduced new syscalls to fix the year 2038 issue.
+To still be able to use the old ones, the Kconfig option
+COMPAT_32BIT_TIME would be necessary.
+
+Use the new syscall with 64-bit values for futex by default.
+Define _ENOSYS for detecting if it's not available.
+Add a fallback to use the older syscall in case the new one is
+not available, since Go runs on Linux from 2.6.32 on, per
+https://go.dev/wiki/MinimumRequirements.
+
+Updates #75133
+
+Change-Id: I65daff0a3d06b55440ff05d8f5a9aa1c07eb201d
+GitHub-Last-Rev: 96dd1bd84bd12d898e971157fc83da562cc4f6b4
+GitHub-Pull-Request: golang/go#75306
+Reviewed-on: https://go-review.googlesource.com/c/go/+/701615
+Reviewed-by: Michael Knyszek <mknyszek@google.com>
+Reviewed-by: Mark Freeman <markfreeman@google.com>
+Reviewed-by: Jorropo <jorropo.pgm@gmail.com>
+LUCI-TryBot-Result: Go LUCI <golang-scoped@luci-project-accounts.iam.gserviceaccount.com>
+(cherry picked from commit 3cf1aaf8b9c846c44ec8db679495dd5816d1ec30)
+
+Upstream-Status: Backport [https://go.googlesource.com/go/+/3cf1aaf8b9c846c44ec8db679495dd5816d1ec30]
+Signed-off-by: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+---
+ src/runtime/defs2_linux.go        |  1 +
+ src/runtime/defs_linux.go         |  1 +
+ src/runtime/defs_linux_386.go     | 23 ++++++++++++++----
+ src/runtime/defs_linux_amd64.go   |  1 +
+ src/runtime/defs_linux_arm.go     | 23 ++++++++++++++----
+ src/runtime/defs_linux_arm64.go   |  1 +
+ src/runtime/defs_linux_loong64.go |  1 +
+ src/runtime/defs_linux_mips64x.go |  1 +
+ src/runtime/defs_linux_mipsx.go   | 23 ++++++++++++++----
+ src/runtime/defs_linux_ppc64.go   |  1 +
+ src/runtime/defs_linux_ppc64le.go |  1 +
+ src/runtime/defs_linux_riscv64.go |  1 +
+ src/runtime/defs_linux_s390x.go   |  1 +
+ src/runtime/os_linux.go           |  5 +---
+ src/runtime/os_linux_futex32.go   | 40 +++++++++++++++++++++++++++++++
+ src/runtime/os_linux_futex64.go   | 14 +++++++++++
+ src/runtime/sys_linux_386.s       | 21 ++++++++++++++--
+ src/runtime/sys_linux_arm.s       | 21 ++++++++++++++--
+ src/runtime/sys_linux_mipsx.s     | 28 ++++++++++++++++++++--
+ 19 files changed, 186 insertions(+), 22 deletions(-)
+ create mode 100644 src/runtime/os_linux_futex32.go
+ create mode 100644 src/runtime/os_linux_futex64.go
+
+diff --git a/src/runtime/defs2_linux.go b/src/runtime/defs2_linux.go
+index 5d6730a7ad..597073c39d 100644
+--- a/src/runtime/defs2_linux.go
++++ b/src/runtime/defs2_linux.go
+@@ -48,6 +48,7 @@ const (
+ 	EINTR  = C.EINTR
+ 	EAGAIN = C.EAGAIN
+ 	ENOMEM = C.ENOMEM
++	ENOSYS = C.ENOSYS
+ 
+ 	PROT_NONE  = C.PROT_NONE
+ 	PROT_READ  = C.PROT_READ
+diff --git a/src/runtime/defs_linux.go b/src/runtime/defs_linux.go
+index 296fcb4bfd..d2b619ecab 100644
+--- a/src/runtime/defs_linux.go
++++ b/src/runtime/defs_linux.go
+@@ -37,6 +37,7 @@ const (
+ 	EINTR  = C.EINTR
+ 	EAGAIN = C.EAGAIN
+ 	ENOMEM = C.ENOMEM
++	ENOSYS = C.ENOSYS
+ 
+ 	PROT_NONE  = C.PROT_NONE
+ 	PROT_READ  = C.PROT_READ
+diff --git a/src/runtime/defs_linux_386.go b/src/runtime/defs_linux_386.go
+index 5fef55610f..e902d8175c 100644
+--- a/src/runtime/defs_linux_386.go
++++ b/src/runtime/defs_linux_386.go
+@@ -9,6 +9,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+@@ -136,16 +137,30 @@ type fpstate struct {
+ 	anon0     [48]byte
+ }
+ 
+-type timespec struct {
++// The timespec structs and types are defined in Linux in
++// include/uapi/linux/time_types.h and include/uapi/asm-generic/posix_types.h.
++type timespec32 struct {
+ 	tv_sec  int32
+ 	tv_nsec int32
+ }
+ 
+ //go:nosplit
+-func (ts *timespec) setNsec(ns int64) {
++func (ts *timespec32) setNsec(ns int64) {
+ 	ts.tv_sec = timediv(ns, 1e9, &ts.tv_nsec)
+ }
+ 
++type timespec struct {
++	tv_sec  int64
++	tv_nsec int64
++}
++
++//go:nosplit
++func (ts *timespec) setNsec(ns int64) {
++	var newNS int32
++	ts.tv_sec = int64(timediv(ns, 1e9, &newNS))
++	ts.tv_nsec = int64(newNS)
++}
++
+ type timeval struct {
+ 	tv_sec  int32
+ 	tv_usec int32
+@@ -223,8 +238,8 @@ type ucontext struct {
+ }
+ 
+ type itimerspec struct {
+-	it_interval timespec
+-	it_value    timespec
++	it_interval timespec32
++	it_value    timespec32
+ }
+ 
+ type itimerval struct {
+diff --git a/src/runtime/defs_linux_amd64.go b/src/runtime/defs_linux_amd64.go
+index dce7799b6a..9a908c9400 100644
+--- a/src/runtime/defs_linux_amd64.go
++++ b/src/runtime/defs_linux_amd64.go
+@@ -9,6 +9,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_arm.go b/src/runtime/defs_linux_arm.go
+index 71cf8c6d50..35c4faf964 100644
+--- a/src/runtime/defs_linux_arm.go
++++ b/src/runtime/defs_linux_arm.go
+@@ -11,6 +11,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_ENOMEM = 0xc
+ 	_EAGAIN = 0xb
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0
+ 	_PROT_READ  = 0x1
+@@ -95,16 +96,30 @@ const (
+ 	_SOCK_DGRAM = 0x2
+ )
+ 
+-type timespec struct {
++// The timespec structs and types are defined in Linux in
++// include/uapi/linux/time_types.h and include/uapi/asm-generic/posix_types.h.
++type timespec32 struct {
+ 	tv_sec  int32
+ 	tv_nsec int32
+ }
+ 
+ //go:nosplit
+-func (ts *timespec) setNsec(ns int64) {
++func (ts *timespec32) setNsec(ns int64) {
+ 	ts.tv_sec = timediv(ns, 1e9, &ts.tv_nsec)
+ }
+ 
++type timespec struct {
++	tv_sec  int64
++	tv_nsec int64
++}
++
++//go:nosplit
++func (ts *timespec) setNsec(ns int64) {
++	var newNS int32
++	ts.tv_sec = int64(timediv(ns, 1e9, &newNS))
++	ts.tv_nsec = int64(newNS)
++}
++
+ type stackt struct {
+ 	ss_sp    *byte
+ 	ss_flags int32
+@@ -155,8 +170,8 @@ func (tv *timeval) set_usec(x int32) {
+ }
+ 
+ type itimerspec struct {
+-	it_interval timespec
+-	it_value    timespec
++	it_interval timespec32
++	it_value    timespec32
+ }
+ 
+ type itimerval struct {
+diff --git a/src/runtime/defs_linux_arm64.go b/src/runtime/defs_linux_arm64.go
+index 606cd70494..4992e91ea6 100644
+--- a/src/runtime/defs_linux_arm64.go
++++ b/src/runtime/defs_linux_arm64.go
+@@ -9,6 +9,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_loong64.go b/src/runtime/defs_linux_loong64.go
+index b983725160..670d4c318d 100644
+--- a/src/runtime/defs_linux_loong64.go
++++ b/src/runtime/defs_linux_loong64.go
+@@ -10,6 +10,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_mips64x.go b/src/runtime/defs_linux_mips64x.go
+index 8a0af41234..7449d2cfac 100644
+--- a/src/runtime/defs_linux_mips64x.go
++++ b/src/runtime/defs_linux_mips64x.go
+@@ -12,6 +12,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_mipsx.go b/src/runtime/defs_linux_mipsx.go
+index 8322beab2b..cec504c885 100644
+--- a/src/runtime/defs_linux_mipsx.go
++++ b/src/runtime/defs_linux_mipsx.go
+@@ -12,6 +12,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+@@ -93,16 +94,30 @@ const (
+ 	_SIGEV_THREAD_ID = 0x4
+ )
+ 
+-type timespec struct {
++// The timespec structs and types are defined in Linux in
++// include/uapi/linux/time_types.h and include/uapi/asm-generic/posix_types.h.
++type timespec32 struct {
+ 	tv_sec  int32
+ 	tv_nsec int32
+ }
+ 
+ //go:nosplit
+-func (ts *timespec) setNsec(ns int64) {
++func (ts *timespec32) setNsec(ns int64) {
+ 	ts.tv_sec = timediv(ns, 1e9, &ts.tv_nsec)
+ }
+ 
++type timespec struct {
++	tv_sec  int64
++	tv_nsec int64
++}
++
++//go:nosplit
++func (ts *timespec) setNsec(ns int64) {
++	var newNS int32
++	ts.tv_sec = int64(timediv(ns, 1e9, &newNS))
++	ts.tv_nsec = int64(newNS)
++}
++
+ type timeval struct {
+ 	tv_sec  int32
+ 	tv_usec int32
+@@ -138,8 +153,8 @@ type siginfo struct {
+ }
+ 
+ type itimerspec struct {
+-	it_interval timespec
+-	it_value    timespec
++	it_interval timespec32
++	it_value    timespec32
+ }
+ 
+ type itimerval struct {
+diff --git a/src/runtime/defs_linux_ppc64.go b/src/runtime/defs_linux_ppc64.go
+index f87924affe..dc45f37b7c 100644
+--- a/src/runtime/defs_linux_ppc64.go
++++ b/src/runtime/defs_linux_ppc64.go
+@@ -9,6 +9,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_ppc64le.go b/src/runtime/defs_linux_ppc64le.go
+index f87924affe..dc45f37b7c 100644
+--- a/src/runtime/defs_linux_ppc64le.go
++++ b/src/runtime/defs_linux_ppc64le.go
+@@ -9,6 +9,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_riscv64.go b/src/runtime/defs_linux_riscv64.go
+index 29b1ef2a50..b73e208ac3 100644
+--- a/src/runtime/defs_linux_riscv64.go
++++ b/src/runtime/defs_linux_riscv64.go
+@@ -10,6 +10,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/defs_linux_s390x.go b/src/runtime/defs_linux_s390x.go
+index b0280213b3..c03d0f2117 100644
+--- a/src/runtime/defs_linux_s390x.go
++++ b/src/runtime/defs_linux_s390x.go
+@@ -10,6 +10,7 @@ const (
+ 	_EINTR  = 0x4
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
++	_ENOSYS = 0x26
+ 
+ 	_PROT_NONE  = 0x0
+ 	_PROT_READ  = 0x1
+diff --git a/src/runtime/os_linux.go b/src/runtime/os_linux.go
+index c2840f744b..d3755a4953 100644
+--- a/src/runtime/os_linux.go
++++ b/src/runtime/os_linux.go
+@@ -40,9 +40,6 @@ type mOS struct {
+ 	waitsema uint32 // semaphore for parking on locks
+ }
+ 
+-//go:noescape
+-func futex(addr unsafe.Pointer, op int32, val uint32, ts, addr2 unsafe.Pointer, val3 uint32) int32
+-
+ // Linux futex.
+ //
+ //	futexsleep(uint32 *addr, uint32 val)
+@@ -79,7 +76,7 @@ func futexsleep(addr *uint32, val uint32, ns int64) {
+ 
+ 	var ts timespec
+ 	ts.setNsec(ns)
+-	futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, unsafe.Pointer(&ts), nil, 0)
++	futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, &ts, nil, 0)
+ }
+ 
+ // If any procs are sleeping on addr, wake up at most cnt.
+diff --git a/src/runtime/os_linux_futex32.go b/src/runtime/os_linux_futex32.go
+new file mode 100644
+index 0000000000..fdf99e5669
+--- /dev/null
++++ b/src/runtime/os_linux_futex32.go
+@@ -0,0 +1,40 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && (386 || arm || mips || mipsle || ppc)
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++//go:noescape
++func futex_time32(addr unsafe.Pointer, op int32, val uint32, ts *timespec32, addr2 unsafe.Pointer, val3 uint32) int32
++
++//go:noescape
++func futex_time64(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
++
++var is32bitOnly atomic.Bool
++
++//go:nosplit
++func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32 {
++	if !is32bitOnly.Load() {
++		ret := futex_time64(addr, op, val, ts, addr2, val3)
++		// futex_time64 is only supported on Linux 5.0+
++		if ret != -_ENOSYS {
++			return ret
++		}
++		is32bitOnly.Store(true)
++	}
++	// Downgrade ts.
++	var ts32 timespec32
++	var pts32 *timespec32
++	if ts != nil {
++		ts32.setNsec(ts.tv_sec*1e9 + ts.tv_nsec)
++		pts32 = &ts32
++	}
++	return futex_time32(addr, op, val, pts32, addr2, val3)
++}
+diff --git a/src/runtime/os_linux_futex64.go b/src/runtime/os_linux_futex64.go
+new file mode 100644
+index 0000000000..487d0e0397
+--- /dev/null
++++ b/src/runtime/os_linux_futex64.go
+@@ -0,0 +1,14 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && !(386 || arm || mips || mipsle || ppc || s390)
++
++package runtime
++
++import (
++	"unsafe"
++)
++
++//go:noescape
++func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
+diff --git a/src/runtime/sys_linux_386.s b/src/runtime/sys_linux_386.s
+index 8e832687e0..1c3f1ff3e6 100644
+--- a/src/runtime/sys_linux_386.s
++++ b/src/runtime/sys_linux_386.s
+@@ -48,6 +48,7 @@
+ #define SYS_madvise		219
+ #define SYS_gettid		224
+ #define SYS_futex		240
++#define SYS_futex_time64	422
+ #define SYS_sched_getaffinity	242
+ #define SYS_set_thread_area	243
+ #define SYS_exit_group		252
+@@ -532,10 +533,26 @@ TEXT runtime·madvise(SB),NOSPLIT,$0
+ 	MOVL	AX, ret+12(FP)
+ 	RET
+ 
++// Linux: kernel/futex/syscalls.c, requiring COMPAT_32BIT_TIME
++// int32 futex(int32 *uaddr, int32 op, int32 val,
++//	struct old_timespec32 *timeout, int32 *uaddr2, int32 val2);
++TEXT runtime·futex_time32(SB),NOSPLIT,$0
++	MOVL	$SYS_futex, AX
++	MOVL	addr+0(FP), BX
++	MOVL	op+4(FP), CX
++	MOVL	val+8(FP), DX
++	MOVL	ts+12(FP), SI
++	MOVL	addr2+16(FP), DI
++	MOVL	val3+20(FP), BP
++	INVOKE_SYSCALL
++	MOVL	AX, ret+24(FP)
++	RET
++
++// Linux: kernel/futex/syscalls.c
+ // int32 futex(int32 *uaddr, int32 op, int32 val,
+ //	struct timespec *timeout, int32 *uaddr2, int32 val2);
+-TEXT runtime·futex(SB),NOSPLIT,$0
+-	MOVL	$SYS_futex, AX
++TEXT runtime·futex_time64(SB),NOSPLIT,$0
++	MOVL	$SYS_futex_time64, AX
+ 	MOVL	addr+0(FP), BX
+ 	MOVL	op+4(FP), CX
+ 	MOVL	val+8(FP), DX
+diff --git a/src/runtime/sys_linux_arm.s b/src/runtime/sys_linux_arm.s
+index 992d32ab6c..44b56ccb9f 100644
+--- a/src/runtime/sys_linux_arm.s
++++ b/src/runtime/sys_linux_arm.s
+@@ -30,6 +30,7 @@
+ #define SYS_sigaltstack (SYS_BASE + 186)
+ #define SYS_mmap2 (SYS_BASE + 192)
+ #define SYS_futex (SYS_BASE + 240)
++#define SYS_futex_time64 (SYS_BASE + 422)
+ #define SYS_exit_group (SYS_BASE + 248)
+ #define SYS_munmap (SYS_BASE + 91)
+ #define SYS_madvise (SYS_BASE + 220)
+@@ -403,9 +404,10 @@ finish:
+ 
+ 	RET
+ 
++// Linux: kernel/futex/syscalls.c, requiring COMPAT_32BIT_TIME
+ // int32 futex(int32 *uaddr, int32 op, int32 val,
+-//	struct timespec *timeout, int32 *uaddr2, int32 val2);
+-TEXT runtime·futex(SB),NOSPLIT,$0
++//	struct old_timespec32 *timeout, int32 *uaddr2, int32 val2);
++TEXT runtime·futex_time32(SB),NOSPLIT,$0
+ 	MOVW    addr+0(FP), R0
+ 	MOVW    op+4(FP), R1
+ 	MOVW    val+8(FP), R2
+@@ -417,6 +419,21 @@ TEXT runtime·futex(SB),NOSPLIT,$0
+ 	MOVW	R0, ret+24(FP)
+ 	RET
+ 
++// Linux: kernel/futex/syscalls.c
++// int32 futex(int32 *uaddr, int32 op, int32 val,
++//	struct timespec *timeout, int32 *uaddr2, int32 val2);
++TEXT runtime·futex_time64(SB),NOSPLIT,$0
++	MOVW    addr+0(FP), R0
++	MOVW    op+4(FP), R1
++	MOVW    val+8(FP), R2
++	MOVW    ts+12(FP), R3
++	MOVW    addr2+16(FP), R4
++	MOVW    val3+20(FP), R5
++	MOVW	$SYS_futex_time64, R7
++	SWI	$0
++	MOVW	R0, ret+24(FP)
++	RET
++
+ // int32 clone(int32 flags, void *stack, M *mp, G *gp, void (*fn)(void));
+ TEXT runtime·clone(SB),NOSPLIT,$0
+ 	MOVW	flags+0(FP), R0
+diff --git a/src/runtime/sys_linux_mipsx.s b/src/runtime/sys_linux_mipsx.s
+index 5e6b6c1504..6f11841efc 100644
+--- a/src/runtime/sys_linux_mipsx.s
++++ b/src/runtime/sys_linux_mipsx.s
+@@ -34,6 +34,7 @@
+ #define SYS_mincore		4217
+ #define SYS_gettid		4222
+ #define SYS_futex		4238
++#define SYS_futex_time64	4422
+ #define SYS_sched_getaffinity	4240
+ #define SYS_exit_group		4246
+ #define SYS_timer_create	4257
+@@ -362,8 +363,10 @@ TEXT runtime·madvise(SB),NOSPLIT,$0-16
+ 	MOVW	R2, ret+12(FP)
+ 	RET
+ 
+-// int32 futex(int32 *uaddr, int32 op, int32 val, struct timespec *timeout, int32 *uaddr2, int32 val2);
+-TEXT runtime·futex(SB),NOSPLIT,$20-28
++// Linux: kernel/futex/syscalls.c, requiring COMPAT_32BIT_TIME
++// int32 futex(int32 *uaddr, int32 op, int32 val,
++//	struct old_timespec32 *timeout, int32 *uaddr2, int32 val2);
++TEXT runtime·futex_time32(SB),NOSPLIT,$20-28
+ 	MOVW	addr+0(FP), R4
+ 	MOVW	op+4(FP), R5
+ 	MOVW	val+8(FP), R6
+@@ -382,6 +385,27 @@ TEXT runtime·futex(SB),NOSPLIT,$20-28
+ 	MOVW	R2, ret+24(FP)
+ 	RET
+ 
++// Linux: kernel/futex/syscalls.c
++// int32 futex(int32 *uaddr, int32 op, int32 val,
++//	struct timespec *timeout, int32 *uaddr2, int32 val2);
++TEXT runtime·futex_time64(SB),NOSPLIT,$20-28
++	MOVW	addr+0(FP), R4
++	MOVW	op+4(FP), R5
++	MOVW	val+8(FP), R6
++	MOVW	ts+12(FP), R7
++
++	MOVW	addr2+16(FP), R8
++	MOVW	val3+20(FP), R9
++
++	MOVW	R8, 16(R29)
++	MOVW	R9, 20(R29)
++
++	MOVW	$SYS_futex_time64, R2
++	SYSCALL
++	BEQ	R7, 2(PC)
++	SUBU	R2, R0, R2	// caller expects negative errno
++	MOVW	R2, ret+24(FP)
++	RET
+ 
+ // int32 clone(int32 flags, void *stk, M *mp, G *gp, void (*fn)(void));
+ TEXT runtime·clone(SB),NOSPLIT|NOFRAME,$0-24

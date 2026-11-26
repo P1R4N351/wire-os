@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jorropo <jorropo.pgm@gmail.com>
+Date: Fri, 17 Oct 2025 19:51:53 +0200
+Subject: [PATCH] runtime: clean dead architectures from go:build constraint
+
+I've didn't caught theses while reviewing CL 701615.
+
+Change-Id: I721978c173a255eb6d7c3e43dea2b903a9fd016d
+Reviewed-on: https://go-review.googlesource.com/c/go/+/712740
+LUCI-TryBot-Result: Go LUCI <golang-scoped@luci-project-accounts.iam.gserviceaccount.com>
+Auto-Submit: Jorropo <jorropo.pgm@gmail.com>
+Reviewed-by: Keith Randall <khr@google.com>
+Reviewed-by: Keith Randall <khr@golang.org>
+Reviewed-by: David Chase <drchase@google.com>
+(cherry picked from commit 9a5a1202f4c4d5a7048b149b65c3e5b82a2de9aa)
+
+Upstream-Status: Backport [https://go.googlesource.com/go/+/9a5a1202f4c4d5a7048b149b65c3e5b82a2de9aa]
+Signed-off-by: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+---
+ src/runtime/os_linux_futex32.go | 2 +-
+ src/runtime/os_linux_futex64.go | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/os_linux_futex32.go b/src/runtime/os_linux_futex32.go
+index fdf99e5669..dbbd86cb39 100644
+--- a/src/runtime/os_linux_futex32.go
++++ b/src/runtime/os_linux_futex32.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build linux && (386 || arm || mips || mipsle || ppc)
++//go:build linux && (386 || arm || mips || mipsle)
+ 
+ package runtime
+ 
+diff --git a/src/runtime/os_linux_futex64.go b/src/runtime/os_linux_futex64.go
+index 487d0e0397..ce0b08c7ba 100644
+--- a/src/runtime/os_linux_futex64.go
++++ b/src/runtime/os_linux_futex64.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build linux && !(386 || arm || mips || mipsle || ppc || s390)
++//go:build linux && !(386 || arm || mips || mipsle)
+ 
+ package runtime
+ 

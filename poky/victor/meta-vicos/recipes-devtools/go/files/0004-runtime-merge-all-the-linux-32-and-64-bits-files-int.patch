@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jorropo <jorropo.pgm@gmail.com>
+Date: Thu, 23 Oct 2025 10:54:00 +0200
+Subject: [PATCH] runtime: merge all the linux 32 and 64 bits files into one
+ for each
+
+Change-Id: I57067c9724dad2fba518b900d6f6a049cc32099e
+Reviewed-on: https://go-review.googlesource.com/c/go/+/714081
+LUCI-TryBot-Result: Go LUCI <golang-scoped@luci-project-accounts.iam.gserviceaccount.com>
+Reviewed-by: Michael Pratt <mpratt@google.com>
+Reviewed-by: Junyang Shao <shaojunyang@google.com>
+(cherry picked from commit ac3369242d3a6d6219fdf1d592effc5e51ddfeb8)
+
+Upstream-Status: Backport [https://go.googlesource.com/go/+/ac3369242d3a6d6219fdf1d592effc5e51ddfeb8]
+Signed-off-by: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+---
+ src/runtime/os_linux32.go         | 78 +++++++++++++++++++++++++++++++
+ src/runtime/os_linux64.go         | 17 +++++++
+ src/runtime/os_linux_futex32.go   | 40 ----------------
+ src/runtime/os_linux_futex64.go   | 14 ------
+ src/runtime/os_linux_settime32.go | 47 -------------------
+ src/runtime/os_linux_settime64.go | 10 ----
+ 6 files changed, 95 insertions(+), 111 deletions(-)
+ create mode 100644 src/runtime/os_linux32.go
+ create mode 100644 src/runtime/os_linux64.go
+ delete mode 100644 src/runtime/os_linux_futex32.go
+ delete mode 100644 src/runtime/os_linux_futex64.go
+ delete mode 100644 src/runtime/os_linux_settime32.go
+ delete mode 100644 src/runtime/os_linux_settime64.go
+
+diff --git a/src/runtime/os_linux32.go b/src/runtime/os_linux32.go
+new file mode 100644
+index 0000000000..1a9b595dfd
+--- /dev/null
++++ b/src/runtime/os_linux32.go
+@@ -0,0 +1,78 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && (386 || arm || mips || mipsle)
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++//go:noescape
++func futex_time32(addr unsafe.Pointer, op int32, val uint32, ts *timespec32, addr2 unsafe.Pointer, val3 uint32) int32
++
++//go:noescape
++func futex_time64(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
++
++var isFutexTime32bitOnly atomic.Bool
++
++//go:nosplit
++func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32 {
++	if !isFutexTime32bitOnly.Load() {
++		ret := futex_time64(addr, op, val, ts, addr2, val3)
++		// futex_time64 is only supported on Linux 5.0+
++		if ret != -_ENOSYS {
++			return ret
++		}
++		isFutexTime32bitOnly.Store(true)
++	}
++	// Downgrade ts.
++	var ts32 timespec32
++	var pts32 *timespec32
++	if ts != nil {
++		ts32.setNsec(ts.tv_sec*1e9 + ts.tv_nsec)
++		pts32 = &ts32
++	}
++	return futex_time32(addr, op, val, pts32, addr2, val3)
++}
++
++//go:noescape
++func timer_settime32(timerid int32, flags int32, new, old *itimerspec32) int32
++
++//go:noescape
++func timer_settime64(timerid int32, flags int32, new, old *itimerspec) int32
++
++var isSetTime32bitOnly atomic.Bool
++
++//go:nosplit
++func timer_settime(timerid int32, flags int32, new, old *itimerspec) int32 {
++	if !isSetTime32bitOnly.Load() {
++		ret := timer_settime64(timerid, flags, new, old)
++		// timer_settime64 is only supported on Linux 5.0+
++		if ret != -_ENOSYS {
++			return ret
++		}
++		isSetTime32bitOnly.Store(true)
++	}
++
++	var newts,oldts itimerspec32
++	var new32,old32 *itimerspec32
++
++	if new != nil {
++		newts.it_interval.setNsec(new.it_interval.tv_sec*1e9 + new.it_interval.tv_nsec)
++		newts.it_value.setNsec(new.it_value.tv_sec*1e9 + new.it_value.tv_nsec)
++		new32 = &newts
++	}
++
++	if old != nil {
++		oldts.it_interval.setNsec(old.it_interval.tv_sec*1e9 + old.it_interval.tv_nsec)
++		oldts.it_value.setNsec(old.it_value.tv_sec*1e9 + old.it_value.tv_nsec)
++		old32 = &oldts
++	}
++
++	// Fall back to 32-bit timer
++	return timer_settime32(timerid, flags, new32, old32)
++}
+diff --git a/src/runtime/os_linux64.go b/src/runtime/os_linux64.go
+new file mode 100644
+index 0000000000..1b5a1cc50e
+--- /dev/null
++++ b/src/runtime/os_linux64.go
+@@ -0,0 +1,17 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && !(386 || arm || mips || mipsle)
++
++package runtime
++
++import (
++	"unsafe"
++)
++
++//go:noescape
++func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
++
++//go:noescape
++func timer_settime(timerid int32, flags int32, new, old *itimerspec) int32
+diff --git a/src/runtime/os_linux_futex32.go b/src/runtime/os_linux_futex32.go
+deleted file mode 100644
+index dbbd86cb39..0000000000
+--- a/src/runtime/os_linux_futex32.go
++++ /dev/null
+@@ -1,40 +0,0 @@
+-// Copyright 2025 The Go Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-//go:build linux && (386 || arm || mips || mipsle)
+-
+-package runtime
+-
+-import (
+-	"internal/runtime/atomic"
+-	"unsafe"
+-)
+-
+-//go:noescape
+-func futex_time32(addr unsafe.Pointer, op int32, val uint32, ts *timespec32, addr2 unsafe.Pointer, val3 uint32) int32
+-
+-//go:noescape
+-func futex_time64(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
+-
+-var is32bitOnly atomic.Bool
+-
+-//go:nosplit
+-func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32 {
+-	if !is32bitOnly.Load() {
+-		ret := futex_time64(addr, op, val, ts, addr2, val3)
+-		// futex_time64 is only supported on Linux 5.0+
+-		if ret != -_ENOSYS {
+-			return ret
+-		}
+-		is32bitOnly.Store(true)
+-	}
+-	// Downgrade ts.
+-	var ts32 timespec32
+-	var pts32 *timespec32
+-	if ts != nil {
+-		ts32.setNsec(ts.tv_sec*1e9 + ts.tv_nsec)
+-		pts32 = &ts32
+-	}
+-	return futex_time32(addr, op, val, pts32, addr2, val3)
+-}
+diff --git a/src/runtime/os_linux_futex64.go b/src/runtime/os_linux_futex64.go
+deleted file mode 100644
+index ce0b08c7ba..0000000000
+--- a/src/runtime/os_linux_futex64.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-// Copyright 2025 The Go Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-//go:build linux && !(386 || arm || mips || mipsle)
+-
+-package runtime
+-
+-import (
+-	"unsafe"
+-)
+-
+-//go:noescape
+-func futex(addr unsafe.Pointer, op int32, val uint32, ts *timespec, addr2 unsafe.Pointer, val3 uint32) int32
+diff --git a/src/runtime/os_linux_settime32.go b/src/runtime/os_linux_settime32.go
+deleted file mode 100644
+index 6df7f21dc9..0000000000
+--- a/src/runtime/os_linux_settime32.go
++++ /dev/null
+@@ -1,47 +0,0 @@
+-// Copyright 2025 The Go Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-//go:build linux && (386 || arm || mips || mipsle)
+-
+-package runtime
+-
+-import "internal/runtime/atomic"
+-
+-var timer32bitOnly atomic.Bool
+-
+-//go:noescape
+-func timer_settime32(timerid int32, flags int32, new, old *itimerspec32) int32
+-
+-//go:noescape
+-func timer_settime64(timerid int32, flags int32, new, old *itimerspec) int32
+-
+-//go:nosplit
+-func timer_settime(timerid int32, flags int32, new, old *itimerspec) int32 {
+-	if !timer32bitOnly.Load() {
+-		ret := timer_settime64(timerid, flags, new, old)
+-		// timer_settime64 is only supported on Linux 5.0+
+-		if ret != -_ENOSYS {
+-			return ret
+-		}
+-		timer32bitOnly.Store(true)
+-	}
+-
+-	var newts,oldts itimerspec32
+-	var new32,old32 *itimerspec32
+-
+-	if new != nil {
+-		newts.it_interval.setNsec(new.it_interval.tv_sec*1e9 + new.it_interval.tv_nsec)
+-		newts.it_value.setNsec(new.it_value.tv_sec*1e9 + new.it_value.tv_nsec)
+-		new32 = &newts
+-	}
+-
+-	if old != nil {
+-		oldts.it_interval.setNsec(old.it_interval.tv_sec*1e9 + old.it_interval.tv_nsec)
+-		oldts.it_value.setNsec(old.it_value.tv_sec*1e9 + old.it_value.tv_nsec)
+-		old32 = &oldts
+-	}
+-
+-	// Fall back to 32-bit timer
+-	return timer_settime32(timerid, flags, new32, old32)
+-}
+diff --git a/src/runtime/os_linux_settime64.go b/src/runtime/os_linux_settime64.go
+deleted file mode 100644
+index 60650da33f..0000000000
+--- a/src/runtime/os_linux_settime64.go
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// Copyright 2025 The Go Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-//go:build linux && !(386 || arm || mips || mipsle)
+-
+-package runtime
+-
+-//go:noescape
+-func timer_settime(timerid int32, flags int32, new, old *itimerspec) int32

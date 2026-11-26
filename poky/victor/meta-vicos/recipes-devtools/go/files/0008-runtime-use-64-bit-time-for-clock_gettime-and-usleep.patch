@@ -1,23 +1,37 @@
-From: P1R4N351 <P1R4N351@users.noreply.github.com>
-Subject: [PATCH] runtime: use 64-bit time for clock_gettime and usleep on linux/arm
-Upstream-Status: Backport [equivalent to golang/go#83314 / CLs 701615, 712642]
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:52:02 +0000
+Subject: [PATCH] runtime: use 64-bit time for clock_gettime and usleep on
+ linux/arm
 
-On 32-bit linux/arm, upstream Go 1.25.9 calls 32-bit __vdso_clock_gettime /
-SYS_clock_gettime (263) with sec_hi hardcoded to 0, and runtime.usleep invokes
-32-bit SYS_nanosleep (162), which returns -ENOSYS when CONFIG_COMPAT_32BIT_TIME
-is disabled.
+CL 701615 and CL 712642 moved futex and timer_settime to their 64-bit
+time variants on 32-bit Linux, selected by use64bitsTimeOn32bits
+(kernel 5.1 or later, from uname). walltime, nanotime1 and usleep
+still used the 32-bit time interfaces: the __vdso_clock_gettime vDSO
+entry with clock_gettime (263) as its fallback, and nanosleep (162).
+On a kernel built without CONFIG_COMPAT_32BIT_TIME both syscalls
+return -ENOSYS: usleep then returns at once, and the clock fallback
+leaves the timespec unwritten.
 
-Register __vdso_clock_gettime64 (0x5ec75a4 / 0xdb8d042), align the 64-bit
-__kernel_timespec to 8 bytes for vDSO C callers in walltime and nanotime1
-(falling back to SYS_clock_gettime64 #403, or 32-bit paths only on -ENOSYS),
-and switch runtime.usleep to SYS_clock_nanosleep_time64 (#407) with -ENOSYS
-fallback to SYS_nanosleep (162).
+When use64bitsTimeOn32bits is set, use __vdso_clock_gettime64 with
+clock_gettime64 (403) as its fallback, and clock_nanosleep_time64
+(407) on CLOCK_MONOTONIC for usleep. The 64-bit timespec is 8-byte
+aligned for the vDSO's C code. Older kernels keep the 32-bit path.
 
-Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
+For #75133
+
+Upstream-Status: Submitted [https://github.com/golang/go/pull/83314]
+Signed-off-by: P1R4N351 <282074240+P1R4N351@users.noreply.github.com>
 ---
+ src/runtime/sys_linux_arm.s   | 127 +++++++++++++++++++++++++++++++---
+ src/runtime/vdso_linux_arm.go |   4 ++
+ 2 files changed, 120 insertions(+), 11 deletions(-)
+
+diff --git a/src/runtime/sys_linux_arm.s b/src/runtime/sys_linux_arm.s
+index f19e293d0f..ebb7acb97a 100644
 --- a/src/runtime/sys_linux_arm.s
 +++ b/src/runtime/sys_linux_arm.s
-@@ -41,6 +41,8 @@
+@@ -42,6 +42,8 @@
  #define SYS_nanosleep (SYS_BASE + 162)
  #define SYS_sched_getaffinity (SYS_BASE + 242)
  #define SYS_clock_gettime (SYS_BASE + 263)
@@ -25,14 +39,20 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 +#define SYS_clock_nanosleep_time64 (SYS_BASE + 407)
  #define SYS_timer_create (SYS_BASE + 257)
  #define SYS_timer_settime (SYS_BASE + 258)
- #define SYS_timer_delete (SYS_BASE + 261)
-@@ -346,10 +348,43 @@
+ #define SYS_timer_settime64 (SYS_BASE + 409)
+@@ -358,9 +360,47 @@ finish:
  	MOVW	R7, m_vdsoPC(R6)
  	RET
  
 -TEXT runtime·walltime(SB),NOSPLIT,$12-12
 +TEXT runtime·walltime(SB),NOSPLIT,$24-12
-+	// Linux 5.1+: 8-byte aligned struct __kernel_timespec (64-bit tv_sec).
++	MOVBU	runtime·use64bitsTimeOn32bits(SB), R4
++	CMP	$0, R4
++	B.EQ	time32
++
++	// Linux 5.1 and later: struct __kernel_timespec, 64-bit tv_sec, which
++	// keeps working without CONFIG_COMPAT_32BIT_TIME and past 2038.
++	// The vDSO's C code may assume its natural 8-byte alignment.
  	MOVW	$CLOCK_REALTIME, R0
 -	MOVW	$spec-12(SP), R1	// timespec
 +	MOVW	$spec-24(SP), R1
@@ -44,13 +64,12 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 +	B.EQ	fallback64
 +
 +	BL	runtime·vdsoCall(SB)
++
 +	JMP	finish64
 +
 +fallback64:
 +	MOVW	$SYS_clock_gettime64, R7
 +	SWI	$0
-+	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels
-+	B.EQ	time32
 +
 +finish64:
 +	MOVW	$spec-24(SP), R3
@@ -64,15 +83,14 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 +	MOVW	R1, sec_hi+4(FP)
 +	MOVW	R2, nsec+8(FP)
 +	RET
- 
++
 +time32:
 +	MOVW	$CLOCK_REALTIME, R0
-+	MOVW	$spec-24(SP), R1
-+
++	MOVW	$spec-24(SP), R1	// struct old_timespec32
+ 
  	MOVW	runtime·vdsoClockgettimeSym(SB), R4
  	CMP	$0, R4
- 	B.EQ	fallback
-@@ -363,8 +398,8 @@
+@@ -375,8 +415,8 @@ fallback:
  	SWI	$0
  
  finish:
@@ -83,31 +101,34 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
  
  	MOVW	R0, sec_lo+0(FP)
  	MOVW	$0, R1
-@@ -373,10 +408,49 @@
+@@ -385,9 +425,52 @@ finish:
  	RET
  
  // func nanotime1() int64
 -TEXT runtime·nanotime1(SB),NOSPLIT,$12-8
 +TEXT runtime·nanotime1(SB),NOSPLIT,$24-8
-+	// Linux 5.1+: 8-byte aligned struct __kernel_timespec (64-bit tv_sec).
++	MOVBU	runtime·use64bitsTimeOn32bits(SB), R4
++	CMP	$0, R4
++	B.EQ	time32
++
++	// As walltime: struct __kernel_timespec, 8-byte aligned.
  	MOVW	$CLOCK_MONOTONIC, R0
 -	MOVW	$spec-12(SP), R1	// timespec
 +	MOVW	$spec-24(SP), R1
 +	ADD	$7, R1
 +	BIC	$7, R1
- 
++
 +	MOVW	runtime·vdsoClockgettime64Sym(SB), R4
 +	CMP	$0, R4
 +	B.EQ	fallback64
 +
 +	BL	runtime·vdsoCall(SB)
++
 +	JMP	finish64
 +
 +fallback64:
 +	MOVW	$SYS_clock_gettime64, R7
 +	SWI	$0
-+	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels
-+	B.EQ	time32
 +
 +finish64:
 +	MOVW	$spec-24(SP), R3
@@ -119,23 +140,23 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 +
 +	MOVW	$1000000000, R3
 +	MULLU	R0, R3, (R1, R0)
-+	MUL	R3, R4
++	MUL	R3, R4	// high word of tv_sec times 1e9, into the upper half
 +	ADD	R4, R1
 +	ADD.S	R2, R0
 +	ADC	$0, R1	// Add carry bit to upper half.
 +
 +	MOVW	R0, ret_lo+0(FP)
 +	MOVW	R1, ret_hi+4(FP)
++
 +	RET
 +
 +time32:
 +	MOVW	$CLOCK_MONOTONIC, R0
-+	MOVW	$spec-24(SP), R1
-+
++	MOVW	$spec-24(SP), R1	// struct old_timespec32
+ 
  	MOVW	runtime·vdsoClockgettimeSym(SB), R4
  	CMP	$0, R4
- 	B.EQ	fallback
-@@ -390,8 +464,8 @@
+@@ -402,8 +485,8 @@ fallback:
  	SWI	$0
  
  finish:
@@ -146,7 +167,7 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
  
  	MOVW	$1000000000, R3
  	MULLU	R0, R3, (R1, R0)
-@@ -563,17 +637,36 @@
+@@ -591,12 +674,34 @@ TEXT runtime·rt_sigaction(SB),NOSPLIT,$0
  	MOVW	R0, ret+16(FP)
  	RET
  
@@ -154,42 +175,41 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
 +TEXT runtime·usleep(SB),NOSPLIT,$20
  	MOVW	usec+0(FP), R0
  	CALL	runtime·usplitR0(SB)
--	MOVW	R0, 4(R13)
--	MOVW	$1000, R0	// usec to nsec
--	MUL	R0, R1
 +	MOVW	$1000, R2	// usec to nsec
 +	MUL	R2, R1
 +
-+	// Linux 5.1+: clock_nanosleep_time64(CLOCK_MONOTONIC, 0, &kts, NULL).
++	MOVBU	runtime·use64bitsTimeOn32bits(SB), R3
++	CMP	$0, R3
++	B.EQ	time32
++
++	// Linux 5.1 and later: clock_nanosleep_time64(CLOCK_MONOTONIC, 0,
++	// &(struct __kernel_timespec){sec, nsec}, NULL). Plain nanosleep is
++	// a 32-bit time syscall, gone without CONFIG_COMPAT_32BIT_TIME.
 +	MOVW	R0, 4(R13)	// tv_sec, low word
 +	MOVW	$0, R2
 +	MOVW	R2, 8(R13)	// tv_sec, high word
 +	MOVW	R1, 12(R13)	// tv_nsec, low word
 +	MOVW	R2, 16(R13)	// tv_nsec, high word
 +	MOVW	$CLOCK_MONOTONIC, R0
-+	MOVW	$0, R1		// flags: relative
++	MOVW	$0, R1	// flags: relative
 +	MOVW	$4(R13), R2
 +	MOVW	$0, R3
 +	MOVW	$SYS_clock_nanosleep_time64, R7
 +	SWI	$0
-+	CMN	$38, R0		// -ENOSYS on pre-5.1 kernels?
-+	B.NE	done
++	RET
 +
-+	// Fallback to 32-bit nanosleep on kernels before Linux 5.1.
-+	MOVW	12(R13), R1
++time32:
+ 	MOVW	R0, 4(R13)
+-	MOVW	$1000, R0	// usec to nsec
+-	MUL	R0, R1
  	MOVW	R1, 8(R13)
  	MOVW	$4(R13), R0
  	MOVW	$0, R1
- 	MOVW	$SYS_nanosleep, R7
- 	SWI	$0
-+
-+done:
- 	RET
- 
- // As for cas, memory barriers are complicated on ARM, but the kernel
+diff --git a/src/runtime/vdso_linux_arm.go b/src/runtime/vdso_linux_arm.go
+index ac3bdcf043..5a7a64f841 100644
 --- a/src/runtime/vdso_linux_arm.go
 +++ b/src/runtime/vdso_linux_arm.go
-@@ -15,7 +15,11 @@
+@@ -15,7 +15,11 @@ var vdsoLinuxVersion = vdsoVersionKey{"LINUX_2.6", 0x3ae75f6}
  
  var vdsoSymbolKeys = []vdsoSymbolKey{
  	{"__vdso_clock_gettime", 0xd35ec75, 0x6e43a318, &vdsoClockgettimeSym},
@@ -199,5 +219,5 @@ Signed-off-by: P1R4N351 <P1R4N351@users.noreply.github.com>
  // initialize to fall back to syscall
  var vdsoClockgettimeSym uintptr = 0
 +
-+// __vdso_clock_gettime64 (Linux 5.1 and later).
++// __vdso_clock_gettime64 (Linux 5.1 and later), used when use64bitsTimeOn32bits is set.
 +var vdsoClockgettime64Sym uintptr = 0
